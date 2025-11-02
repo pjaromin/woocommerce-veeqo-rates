@@ -1,9 +1,10 @@
 # Changelog
 
-## [0.4.0] - 2025-10-31
-### Added
-- Initial public release.
-- Veeqo Rate Shopping integration using `x-api-key`.
-- Optional `allocation_id` field for testing.
-- Debug mode (probe rate + verbose logs).
-- Filters for label and Woo rate customization.
+## 0.5.0
+- Removed debug/fake rate.
+- Implemented live flow: create Veeqo order → allocation → update package → fetch quotes.
+- New settings per zone: Channel/Store ID, Warehouse ID, default package L/W/H (cm) + weight (g).
+- Added basic admin stylesheet.
+
+## 0.4.0
+- Initial public-ready skeleton with debug rate and logging.
