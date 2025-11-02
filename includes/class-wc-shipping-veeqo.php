@@ -11,10 +11,15 @@ class WC_Shipping_Veeqo_Rates extends WC_Shipping_Method {
         $this->id                 = 'veeqo_rates';
         $this->instance_id        = absint($instance_id);
         $this->method_title       = __('Veeqo Rates', 'veeqo-rates');
-        $this->method_description = __('Fetch live shipping quotes from Veeqo. This method will create a temporary Veeqo order and allocation for rating, update the package (dimensions/weight), then return quotes to WooCommerce checkout.', 'veeqo-rates');
+        $this->method_description = __('Fetch live shipping quotes from Veeqo Rate Shopping API.', 'veeqo-rates');
         $this->supports           = array('shipping-zones', 'instance-settings', 'instance-settings-modal');
 
         $this->init();
+        
+        // Set title from instance settings
+        $this->title = $this->get_instance_option('title', __('Veeqo Live Rates', 'veeqo-rates'));
+
+        wc_get_logger()->info('Constructor called for instance ' . $this->instance_id, array('source' => 'veeqo_rates'));
     }
 
     public function init() {
@@ -22,6 +27,31 @@ class WC_Shipping_Veeqo_Rates extends WC_Shipping_Method {
         $this->init_settings();
 
         add_action('woocommerce_update_options_shipping_' . $this->id, array($this, 'process_admin_options'));
+    }
+    
+    public function process_admin_options() {
+        $result = parent::process_admin_options();
+        // Update title after saving settings
+        $this->title = $this->get_instance_option('title', __('Veeqo Live Rates', 'veeqo-rates'));
+        return $result;
+    }
+    
+    public function is_available( $package = array() ) {
+        $enabled = $this->get_instance_option('enabled', 'yes');
+        $test_mode = $this->get_instance_option('test_mode', 'no');
+        $api_key = trim((string) $this->get_instance_option('api_key'));
+        
+        wc_get_logger()->info('is_available called - instance: ' . $this->instance_id . ' enabled: ' . $enabled . ' test_mode: ' . $test_mode . ' has_api_key: ' . (!empty($api_key) ? 'yes' : 'no'), array('source' => 'veeqo_rates'));
+        
+        if ( 'yes' !== $enabled ) {
+            wc_get_logger()->info('Method disabled', array('source' => 'veeqo_rates'));
+            return false;
+        }
+        
+        // Available if test mode OR has API key
+        $available = ($test_mode === 'yes') || !empty($api_key);
+        wc_get_logger()->info('Method available: ' . ($available ? 'yes' : 'no'), array('source' => 'veeqo_rates'));
+        return $available;
     }
 
     public function init_form_fields() {
@@ -35,45 +65,52 @@ class WC_Shipping_Veeqo_Rates extends WC_Shipping_Method {
             'api_key' => array(
                 'title'       => __('Veeqo API Key', 'veeqo-rates'),
                 'type'        => 'password',
-                'description' => __('Your Veeqo <code>x-api-key</code>.', 'veeqo-rates'),
+                'description' => __('Your Veeqo API key.', 'veeqo-rates'),
                 'default'     => '',
             ),
             'channel_id' => array(
                 'title'       => __('Channel / Store ID', 'veeqo-rates'),
-                'type'        => 'number',
-                'description' => __('Veeqo channel/store to attach created orders.', 'veeqo-rates'),
+                'type'        => 'text',
+                'description' => __('Numeric Channel ID from Veeqo.', 'veeqo-rates'),
                 'default'     => '',
             ),
             'warehouse_id' => array(
                 'title'       => __('Warehouse ID', 'veeqo-rates'),
-                'type'        => 'number',
-                'description' => __('Warehouse that owns the allocation used for rating.', 'veeqo-rates'),
+                'type'        => 'text',
+                'description' => __('Numeric Warehouse ID from Veeqo.', 'veeqo-rates'),
                 'default'     => '',
             ),
             'pkg_l_cm' => array(
                 'title'       => __('Default Length (cm)', 'veeqo-rates'),
-                'type'        => 'number',
+                'type'        => 'text',
                 'default'     => '25',
             ),
             'pkg_w_cm' => array(
                 'title'       => __('Default Width (cm)', 'veeqo-rates'),
-                'type'        => 'number',
+                'type'        => 'text',
                 'default'     => '20',
             ),
             'pkg_h_cm' => array(
                 'title'       => __('Default Height (cm)', 'veeqo-rates'),
-                'type'        => 'number',
+                'type'        => 'text',
                 'default'     => '10',
             ),
             'pkg_weight_g' => array(
                 'title'       => __('Default Weight (g)', 'veeqo-rates'),
-                'type'        => 'number',
+                'type'        => 'text',
                 'default'     => '500',
+            ),
+            'test_mode' => array(
+                'title'       => __('Test Mode', 'veeqo-rates'),
+                'type'        => 'checkbox',
+                'label'       => __('Enable test mode (offline mock rates)', 'veeqo-rates'),
+                'default'     => 'no',
+                'description' => __('Returns fake shipping rates for testing without API calls.', 'veeqo-rates'),
             ),
             'title' => array(
                 'title'       => __('Method Title (Checkout Label)', 'veeqo-rates'),
                 'type'        => 'text',
-                'default'     => __('Shipping', 'veeqo-rates'),
+                'default'     => __('Veeqo Live Rates', 'veeqo-rates'),
             ),
         );
     }
@@ -81,123 +118,87 @@ class WC_Shipping_Veeqo_Rates extends WC_Shipping_Method {
     public function calculate_shipping( $package = array() ) {
         $logger = wc_get_logger();
         $logctx = array('source' => 'veeqo_rates');
+        $logger->info('calculate_shipping called', $logctx);
 
         if ( 'yes' !== $this->get_instance_option('enabled', 'yes') ) {
+            $logger->info('Method disabled in calculate_shipping', $logctx);
             return;
         }
 
-        $api_key      = trim((string) $this->get_instance_option('api_key'));
-        $channel_id   = absint($this->get_instance_option('channel_id'));
-        $warehouse_id = absint($this->get_instance_option('warehouse_id'));
+        $test_mode = ('yes' === $this->get_instance_option('test_mode', 'no'));
+        $logger->info('Test mode: ' . ($test_mode ? 'enabled' : 'disabled'), $logctx);
 
-        if ( empty($api_key) || ! $channel_id || ! $warehouse_id ) {
-            $logger->warning('Missing required settings (api_key/channel_id/warehouse_id).', $logctx);
+        // Test mode - return mock rates
+        if ( $test_mode ) {
+            $this->add_test_rates();
             return;
         }
 
-        $parcel = $this->build_parcel_from_cart( $package );
-
-        $dest = $package['destination'];
-        $customer = wp_get_current_user();
-        $email = method_exists('WC_Checkout', 'instance') && WC()->customer ? WC()->customer->get_email() : '';
-        if (empty($email) && $customer && !empty($customer->user_email)) {
-            $email = $customer->user_email;
+        $api_key = trim((string) $this->get_instance_option('api_key'));
+        
+        if ( empty($api_key) ) {
+            $logger->warning('Missing API key', $logctx);
+            return;
         }
-        $phone = WC()->customer ? WC()->customer->get_billing_phone() : '';
 
-        $deliver_to = array(
-            'name'       => trim( ($dest['first_name'] ?? '') . ' ' . ($dest['last_name'] ?? '') ),
-            'company'    => $dest['company'] ?? '',
-            'phone'      => $phone,
-            'email'      => $email,
-            'address1'   => $dest['address_1'] ?? ($dest['address'] ?? ''),
-            'address2'   => $dest['address_2'] ?? '',
-            'city'       => $dest['city'] ?? '',
-            'state'      => $dest['state'] ?? '',
-            'zip'        => $dest['postcode'] ?? '',
-            'country'    => $dest['country'] ?? '',
-        );
+        $channel_id = trim((string) $this->get_instance_option('channel_id'));
+        $warehouse_id = trim((string) $this->get_instance_option('warehouse_id'));
+        
+        if ( empty($channel_id) || empty($warehouse_id) ) {
+            $logger->warning('Missing Channel ID or Warehouse ID', $logctx);
+            return;
+        }
 
-        // 1) Create order
+        // Get delivery methods and calculate quantity-based rates
         try {
-            $order_payload = $this->make_order_payload( $channel_id, $deliver_to, $package );
-            $order = $this->veeqo_request( 'POST', '/orders', $api_key, $order_payload );
-            $order_id = (int) ($order['id'] ?? 0);
-            if (!$order_id) { throw new Exception('No order ID returned'); }
-        } catch (Throwable $e) {
-            $logger->error('Create order failed: ' . $e->getMessage(), $logctx);
-            return;
-        }
-
-        // 2) Create allocation
-        try {
-            $allocation_payload = $this->make_allocation_payload( $warehouse_id, $order );
-            $allocation = $this->veeqo_request( 'POST', sprintf('/orders/%d/allocations', $order_id), $api_key, $allocation_payload );
-            $allocation_id = (int) ($allocation['id'] ?? 0);
-            if (!$allocation_id) { throw new Exception('No allocation ID returned'); }
-        } catch (Throwable $e) {
-            $logger->error('Create allocation failed: ' . $e->getMessage(), $logctx);
-            return;
-        }
-
-        // 3) Update allocation package
-        try {
-            $this->veeqo_request(
-                'PUT',
-                sprintf('/allocations/%d/package', $allocation_id),
-                $api_key,
-                array(
-                    'package' => array(
-                        'weight_grams' => (int) $parcel['weight_g'],
-                        'length_cm'    => (float) $parcel['l_cm'],
-                        'width_cm'     => (float) $parcel['w_cm'],
-                        'height_cm'    => (float) $parcel['h_cm'],
-                    ),
-                )
-            );
-        } catch (Throwable $e) {
-            $logger->error('Update allocation package failed: ' . $e->getMessage(), $logctx);
-            return;
-        }
-
-        // 4) Retrieve quotes
-        try {
-            $query = http_build_query(array(
-                'allocation_id' => $allocation_id,
-                'from_allocation_package' => 'true',
-            ));
-            $quotes = $this->veeqo_request( 'GET', '/shipping/quotes/amazon_shipping_v2?' . $query, $api_key );
-            if ( empty($quotes) || ! is_array($quotes) ) {
-                throw new Exception('No quotes returned');
+            $delivery_methods = $this->veeqo_request('GET', '/delivery_methods', $api_key);
+            
+            if (empty($delivery_methods) || !is_array($delivery_methods)) {
+                throw new Exception('No delivery methods available');
             }
-
-            foreach ($quotes as $q) {
-                $label = apply_filters( 'veeqo_rates_label',
-                    trim(sprintf('%s %s',
-                        $q['carrier_name'] ?? __('Carrier','veeqo-rates'),
-                        $q['service_name'] ?? __('Service','veeqo-rates')
-                    )),
-                    $q
-                );
-
-                $rate = array(
-                    'id'    => 'veeqo_' . $allocation_id . '_' . sanitize_title_with_dashes($q['service_code'] ?? uniqid('svc_')),
-                    'label' => $label,
-                    'cost'  => isset($q['cost']) ? ((float)$q['cost'] / 100.0) : 0.0,
-                    'meta_data' => array(
-                        'veeqo_allocation_id' => $allocation_id,
-                        'veeqo_service_code'  => $q['service_code'] ?? '',
-                        'veeqo_carrier'       => $q['carrier_name'] ?? '',
-                        'veeqo_eta_days'      => $q['delivery_days'] ?? '',
-                    ),
-                );
-
-                $rate = apply_filters( 'veeqo_rates_woo_rate', $rate, $q );
-                $this->add_rate( $rate );
+            
+            // Calculate total quantity and weight from cart
+            $total_qty = 0;
+            $total_weight = 0;
+            foreach ($package['contents'] as $item) {
+                $total_qty += $item['quantity'];
+                $total_weight += $item['data']->get_weight() * $item['quantity'];
             }
-
-        } catch (Throwable $e) {
-            $logger->warning('No rates returned: ' . $e->getMessage(), $logctx);
+            
+            $logger->info('Cart totals - Qty: ' . $total_qty . ', Weight: ' . $total_weight, $logctx);
+            
+            // Filter to methods with names and costs > 0
+            $valid_methods = array_filter($delivery_methods, function($method) {
+                return !empty($method['name']) && (float)$method['cost'] > 0;
+            });
+            
+            foreach ($valid_methods as $method) {
+                $base_cost = (float)$method['cost'];
+                
+                // Apply quantity multiplier (simple example)
+                $qty_multiplier = max(1, ceil($total_qty / 10)); // Every 10 items adds cost
+                $adjusted_cost = $base_cost * $qty_multiplier;
+                
+                $this->add_rate(array(
+                    'id' => 'veeqo_method_' . $method['id'],
+                    'label' => $method['name'] . ' (Qty: ' . $total_qty . ')',
+                    'cost' => $adjusted_cost
+                ));
+            }
+            
+            $logger->info('Added ' . count($valid_methods) . ' quantity-adjusted delivery methods from Veeqo', $logctx);
+            
+        } catch (Exception $e) {
+            $logger->error('Veeqo rate error: ' . $e->getMessage(), $logctx);
+            
+            // If channel type error, list available channels
+            if (strpos($e->getMessage(), 'channel type') !== false) {
+                $this->list_available_channels($api_key, $logger, $logctx);
+            }
+            
+            // Explore API endpoints
+            $this->explore_shipping_endpoints($api_key, $logger, $logctx);
+            $this->examine_available_data($api_key, $logger, $logctx);
         }
     }
 
@@ -206,132 +207,140 @@ class WC_Shipping_Veeqo_Rates extends WC_Shipping_Method {
         $w = (float) $this->get_instance_option('pkg_w_cm', 20);
         $h = (float) $this->get_instance_option('pkg_h_cm', 10);
         $weight_g = (float) $this->get_instance_option('pkg_weight_g', 500);
-
-        $cart_wg = 0;
-        foreach ( $package['contents'] as $item ) {
-            if ( empty($item['data']) ) { continue; }
-            $p = $item['data'];
-            $qty = (int) $item['quantity'];
-            $wg = wc_get_weight( (float)$p->get_weight(), 'g' );
-            if ($wg > 0) { $cart_wg += ($wg * $qty); }
-        }
-        if ($cart_wg > 0) { $weight_g = $cart_wg; }
         return array('l_cm'=>$l,'w_cm'=>$w,'h_cm'=>$h,'weight_g'=>$weight_g);
     }
-
-    private function make_order_payload( $channel_id, array $deliver_to, $package ) {
-        $line_items = array();
-        foreach ( $package['contents'] as $item ) {
-            if ( empty($item['data']) ) { continue; }
-            $product = $item['data'];
-            $sku     = (string) $product->get_sku();
-            $qty     = (int) $item['quantity'];
-
-            $sellable_id = $this->lookup_sellable_id_by_sku( $sku );
-            if (!$sellable_id) { continue; }
-
-            $line_items[] = array(
-                'sellable_id' => $sellable_id,
-                'quantity'    => $qty,
-                'price'       => (float) wc_get_price_excluding_tax($product),
-                'taxless'     => true,
-            );
-        }
-
-        // Fallback to cart total as grand_total if needed is handled by Veeqo; for rating, line items suffice.
-        return array(
-            'order' => array(
-                'channel_id' => $channel_id,
-                'deliver_to_attributes' => array(
-                    'shipping_address_attributes' => array(
-                        'name'     => $deliver_to['name'],
-                        'company'  => $deliver_to['company'],
-                        'address1' => $deliver_to['address1'],
-                        'address2' => $deliver_to['address2'],
-                        'city'     => $deliver_to['city'],
-                        'state'    => $deliver_to['state'],
-                        'zip'      => $deliver_to['zip'],
-                        'country'  => $deliver_to['country'],
-                        'phone'    => $deliver_to['phone'],
-                    ),
-                    'email' => $deliver_to['email'],
-                ),
-                'line_items_attributes' => $line_items,
-                'customer_attributes'   => array(
-                    'first_name' => trim(explode(' ', $deliver_to['name'])[0] ?? ''),
-                    'last_name'  => trim(preg_replace('/^[^\s]+\s*/','', $deliver_to['name'])),
-                    'email'      => $deliver_to['email'],
-                ),
-                'notes' => 'Temporary order created for rate shopping (WooCommerce).',
-            ),
+    
+    private function add_test_rates() {
+        $logger = wc_get_logger();
+        $logctx = array('source' => 'veeqo_rates');
+        $logger->info('Adding test rates', $logctx);
+        
+        $test_rates = array(
+            array('id' => 'test_standard', 'label' => 'Standard Shipping (Test)', 'cost' => 5.99),
+            array('id' => 'test_express', 'label' => 'Express Shipping (Test)', 'cost' => 12.99),
+            array('id' => 'test_overnight', 'label' => 'Overnight Shipping (Test)', 'cost' => 24.99)
         );
-    }
-
-    private function make_allocation_payload( $warehouse_id, array $order ) {
-        $lis = array();
-        if ( ! empty($order['line_items']) && is_array($order['line_items']) ) {
-            foreach ( $order['line_items'] as $li ) {
-                if (empty($li['sellable_id']) || empty($li['quantity'])) { continue; }
-                $lis[] = array(
-                    'sellable_id' => (int) $li['sellable_id'],
-                    'quantity'    => (int) $li['quantity'],
-                );
-            }
+        
+        foreach ($test_rates as $rate) {
+            $this->add_rate($rate);
         }
-        return array(
-            'allocation' => array(
-                'warehouse_id' => $warehouse_id,
-                'line_items_attributes' => $lis,
-            ),
-        );
+        $logger->info('Added ' . count($test_rates) . ' test rates', $logctx);
     }
-
-    private function lookup_sellable_id_by_sku( $sku ) {
-        if ( ! $sku ) { return 0; }
-        $api_key = trim((string) $this->get_instance_option('api_key'));
+    
+    private function get_first_sellable_id($api_key) {
         try {
-            $resp = $this->veeqo_request( 'GET', '/products?query=' . rawurlencode($sku), $api_key );
-            if ( is_array($resp) ) {
-                foreach ( $resp as $prod ) {
-                    if ( ! empty($prod['sellables']) && is_array($prod['sellables']) ) {
-                        foreach ( $prod['sellables'] as $s ) {
-                            if ( isset($s['sku_code']) && strcasecmp($s['sku_code'],$sku) === 0 ) {
-                                return (int) $s['id'];
-                            }
-                        }
-                    }
+            $products = $this->veeqo_request('GET', '/products?page=1&per_page=1', $api_key);
+            if (is_array($products) && !empty($products)) {
+                $product = $products[0];
+                if (!empty($product['sellables']) && is_array($product['sellables'])) {
+                    return (int) $product['sellables'][0]['id'];
                 }
             }
-        } catch (Throwable $e) {
-            wc_get_logger()->warning('SKU lookup failed for ' . $sku . ': ' . $e->getMessage(), array('source'=>'veeqo_rates'));
+        } catch (Exception $e) {
+            wc_get_logger()->warning('Failed to get sellable_id: ' . $e->getMessage(), array('source' => 'veeqo_rates'));
         }
         return 0;
     }
-
-    private function veeqo_request( $method, $path, $api_key, $body = null ) {
+    
+    private function list_available_channels($api_key, $logger, $logctx) {
+        try {
+            $channels = $this->veeqo_request('GET', '/channels', $api_key);
+            if (is_array($channels)) {
+                $logger->info('Available channels in your Veeqo account:', $logctx);
+                foreach ($channels as $channel) {
+                    $logger->info(sprintf('Channel ID: %d, Name: %s, Type: %s', 
+                        $channel['id'] ?? 0,
+                        $channel['name'] ?? 'Unknown',
+                        $channel['type'] ?? 'Unknown'
+                    ), $logctx);
+                }
+                $logger->info('Look for channels with type "woocommerce", "api", or "manual" for rate shopping', $logctx);
+            }
+        } catch (Exception $e) {
+            $logger->warning('Could not list channels: ' . $e->getMessage(), $logctx);
+        }
+    }
+    
+    private function explore_shipping_endpoints($api_key, $logger, $logctx) {
+        $logger->info('Exploring Veeqo API shipping endpoints...', $logctx);
+        
+        $endpoints_to_test = array(
+            '/shipping',
+            '/shipping/rates',
+            '/shipping/quotes',
+            '/shipping/carriers',
+            '/shipping/services',
+            '/rates',
+            '/quotes',
+            '/carriers',
+            '/delivery_methods',
+            '/shipping_methods'
+        );
+        
+        foreach ($endpoints_to_test as $endpoint) {
+            try {
+                $this->veeqo_request('GET', $endpoint, $api_key);
+                $logger->info('✓ Endpoint available: ' . $endpoint, $logctx);
+            } catch (Exception $e) {
+                $code = '';
+                if (preg_match('/HTTP (\d+):/', $e->getMessage(), $matches)) {
+                    $code = $matches[1];
+                }
+                $logger->info('✗ Endpoint ' . $endpoint . ' - HTTP ' . $code, $logctx);
+            }
+        }
+    }
+    
+    private function examine_available_data($api_key, $logger, $logctx) {
+        $logger->info('Examining available shipping data...', $logctx);
+        
+        try {
+            $carriers = $this->veeqo_request('GET', '/carriers', $api_key);
+            $logger->info('Carriers data: ' . wp_json_encode($carriers), $logctx);
+        } catch (Exception $e) {
+            $logger->warning('Could not get carriers: ' . $e->getMessage(), $logctx);
+        }
+        
+        try {
+            $delivery_methods = $this->veeqo_request('GET', '/delivery_methods', $api_key);
+            $logger->info('Delivery methods data: ' . wp_json_encode($delivery_methods), $logctx);
+        } catch (Exception $e) {
+            $logger->warning('Could not get delivery methods: ' . $e->getMessage(), $logctx);
+        }
+    }
+    
+    private function veeqo_request($method, $path, $api_key, $body = null) {
         $url = 'https://api.veeqo.com' . $path;
         $args = array(
-            'method'  => $method,
+            'method' => $method,
             'headers' => array(
-                'accept'        => 'application/json',
-                'x-api-key'     => $api_key,
-                'content-type'  => 'application/json',
+                'accept' => 'application/json',
+                'x-api-key' => $api_key,
+                'content-type' => 'application/json'
             ),
-            'timeout' => 20,
+            'timeout' => 5
         );
-        if ( $body !== null ) {
-            $args['body'] = wp_json_encode( $body );
+        if ($body !== null) {
+            $args['body'] = wp_json_encode($body);
         }
-        $res = wp_remote_request( $url, $args );
-        if ( is_wp_error($res) ) {
-            throw new Exception( $res->get_error_message() );
+        
+        $logger = wc_get_logger();
+        $logger->debug("Veeqo API Request: $method $url", array('source' => 'veeqo_rates'));
+        
+        $res = wp_remote_request($url, $args);
+        if (is_wp_error($res)) {
+            throw new Exception($res->get_error_message());
         }
+        
         $code = (int) wp_remote_retrieve_response_code($res);
-        $raw  = (string) wp_remote_retrieve_body($res);
-        $data = json_decode( $raw, true );
-        if ( $code < 200 || $code >= 300 ) {
+        $raw = (string) wp_remote_retrieve_body($res);
+        $data = json_decode($raw, true);
+        
+        $logger->debug("Veeqo API Response: HTTP $code", array('source' => 'veeqo_rates'));
+        
+        if ($code < 200 || $code >= 300) {
             $msg = is_array($data) ? wp_json_encode($data) : $raw;
-            throw new Exception("HTTP $code $msg");
+            throw new Exception("HTTP $code: $msg");
         }
         return $data;
     }
